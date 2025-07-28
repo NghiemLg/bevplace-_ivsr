@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -144,13 +145,13 @@ class VisionTransformerBase(nn.Module):
         # Load the pre-trained ViT-B/16 model
         vit = models.vit_b_16(pretrained=pretrained)
         
-        # Extract the transformer backbone without class token and final linear layer
+        # Extract the transformer backbone without final linear layer
         self.conv_norm = vit.conv_proj
         self.encoder = vit.encoder
         self.patch_embed = vit.patch_embed
         
-        # Remove class token embedding
-        self.class_token = None
+        # Keep class token embedding
+        self.class_token = nn.Parameter(vit.class_token.data.clone())
         
         # Store configuration
         self.hidden_dim = vit.hidden_dim
@@ -163,8 +164,13 @@ class VisionTransformerBase(nn.Module):
         x = self.conv_norm(x)  # [B, hidden_dim, H', W']
         x = self.patch_embed(x)  # [B, num_patches, hidden_dim]
         
-        # Process through transformer encoder
-        x = self.encoder(x)  # [B, num_patches, hidden_dim]
+        # Add class token
+        batch_size = x.shape[0]
+        class_token = self.class_token.expand(batch_size, -1, -1)  # [B, 1, hidden_dim]
+        x = torch.cat([class_token, x], dim=1)  # [B, num_patches + 1, hidden_dim]
         
-        # Return patch embeddings
+        # Process through transformer encoder
+        x = self.encoder(x)  # [B, num_patches + 1, hidden_dim]
+        
+        # Return patch embeddings (including class token)
         return x
