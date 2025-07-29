@@ -64,9 +64,9 @@ class REIN(nn.Module):
         self.global_feat_dim = self.local_feat_dim * 64
     
     def forward(self, x):
-        out1, local_feats, global_desc_init = self.rem(x)
+        out1, global_desc_init = self.rem(x)
         global_desc = self.pooling(out1)  # Use NetVLAD for final global descriptor
-        return out1, local_feats, global_desc
+        return out1, global_desc
 
 class VisionTransformerBase(nn.Module):
     def __init__(self, image_size=224, patch_size=16, pretrained=False):
@@ -229,13 +229,8 @@ class REM(nn.Module):
         out1 = F.grid_sample(equ_features, grid, align_corners=True, mode='bicubic')
         out1 = F.normalize(out1, dim=1)
 
-        # Upsample for keypoints
-        grid = F.affine_grid(aff, [B, 128, H_orig, W_orig], align_corners=True)
-        out2 = F.grid_sample(equ_features, grid, align_corners=True, mode='bicubic')
-        out2 = F.normalize(out2, dim=1)
-
         # Create global descriptor by averaging over spatial dimensions
         global_desc = F.adaptive_avg_pool2d(out1, (1, 1)).squeeze(-1).squeeze(-1)  # [B, 128]
         global_desc = F.normalize(global_desc, p=2, dim=1)  # L2 normalize
 
-        return out1, out2, global_desc
+        return out1, global_desc

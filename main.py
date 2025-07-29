@@ -43,7 +43,7 @@ def get_args():
     parser.add_argument('--weightDecay', type=float, default=0.001, help='Weight decay for SGD.')
     parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for SGD.')
 
-    parser.add_argument('--threads', type=int, default=24, help='Number of threads for each data loader to use')
+    parser.add_argument('--threads', type=int, default=16, help='Number of threads for each data loader to use')
     parser.add_argument('--seed', type=int, default=1024, help='Random seed to use.')
 
 
@@ -101,7 +101,7 @@ def train_epoch(epoch, model, train_set):
                 for iteration, (query, positives, negatives, indices) in enumerate(training_data_loader, 1):
                     
                     query = query.to(device)
-                    _, _, global_descs = model(query)
+                    _, global_descs = model(query)
                     h5feat[indices, :] = global_descs.detach().cpu().numpy()
         train_set.mining=True
         train_set.refreshCache()
@@ -119,7 +119,7 @@ def train_epoch(epoch, model, train_set):
 
         input = input.to(device)
         
-        _, _, global_descs = model(input)
+        _, global_descs = model(input)
 
         global_descs_Q, global_descs_P, global_descs_N = torch.split(global_descs, [B, B, negatives.shape[0]])
         
