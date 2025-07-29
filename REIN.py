@@ -16,6 +16,7 @@ class NetVLAD(nn.Module):
             dim : int
                 Dimension of descriptors
         """
+
         super(NetVLAD, self).__init__()
         self.num_clusters = num_clusters
         self.dim = dim
@@ -53,79 +54,6 @@ class NetVLAD(nn.Module):
         vlad = F.normalize(vlad, p=2, dim=1)  # L2 normalize
 
         return vlad
-
-class REM(nn.Module):
-    def __init__(self, from_scratch=False, rotations=8):
-        super(REM, self).__init__()
-        
-        # cnn backbone
-        pretrain = not from_scratch
-        encoder = models.resnet34(pretrained=pretrain) #resnet34
-        layers = list(encoder.children())[:-4]
-        self.encoder = nn.Sequential(*layers)
-
-        # rotations
-        self.angles = -torch.arange(0,359.00001,360.0/rotations)/180*torch.pi
-
-    def forward(self, x):
-        equ_features = []
-        batch_size = x.size(0)
-
-        for i in range(len(self.angles)):
-            # input warp grids
-            aff = torch.zeros(batch_size,2,3).cuda()
-            aff[:,0,0]=torch.cos(-self.angles[i])
-            aff[:,0,1]=torch.sin(-self.angles[i])
-            aff[:,1,0]=-torch.sin(-self.angles[i])
-            aff[:,1,1]=torch.cos(-self.angles[i])
-            grid = F.affine_grid(aff, list(x.size()),align_corners=True).type(x.type())
-            
-            # input warp
-            warped_im = F.grid_sample(x, grid,align_corners=True,mode='bicubic')
-                                    
-            # cnn backbone feature
-            print("Input shape to resnet34 (self.encoder):", warped_im.shape)
-            out = self.encoder(warped_im) 
-            print("Output shape from resnet34 (self.encoder):", out.shape)
-
-            # output feature warp grids           
-            if i==0:
-                im1_init_size = out.size()
-
-            aff = torch.zeros(batch_size,2,3).cuda()
-            aff[:,0,0]=torch.cos(self.angles[i])
-            aff[:,0,1]=torch.sin(self.angles[i])
-            aff[:,1,0]=-torch.sin(self.angles[i])
-            aff[:,1,1]=torch.cos(self.angles[i])
-            grid = F.affine_grid(aff, list(im1_init_size),align_corners=True).type(x.type())
-
-            # output feature warp    
-            out = F.grid_sample(out, grid ,align_corners=True,mode='bicubic')
-            equ_features.append(out.unsqueeze(-1))
-        
-        equ_features = torch.cat(equ_features, dim=-1)  # B C H W R
-        B, C, H, W, R = equ_features.shape
-        equ_features=torch.max(equ_features,dim=-1,keepdim=False)[0] # max pooling along rotations
-
-        aff = torch.zeros(batch_size,2,3).cuda()
-        aff[:,0,0]=1
-        aff[:,0,1]=0
-        aff[:,1,0]=0
-        aff[:,1,1]=1
-
-        # upsample for NetVLAD
-        B,C,H,W = x.size()
-        grid = F.affine_grid(aff, list(x.size()))
-        out1 = F.grid_sample(equ_features, grid,align_corners=True,mode='bicubic')
-        out1 = F.normalize(out1, dim=1)
-        
-        # upsample for keypoints
-        grid = F.affine_grid(aff, list(x.size()))
-        out2 = F.grid_sample(equ_features, grid,align_corners=True,mode='bicubic')
-        out2 = F.normalize(out2, dim=1)
-        
-        return out1, out2
-
 class REIN(nn.Module):
     def __init__(self):
         super(REIN, self).__init__()
@@ -138,11 +66,48 @@ class REIN(nn.Module):
         out1, local_feats = self.rem(x)
         global_desc = self.pooling(out1)
         return out1, local_feats, global_desc
+    def __init__(self):
+        super(CNNProcessor, self).__init__()
+        
+        # CNN architecture with smaller stride for better spatial relationship
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(5, 20), stride=(4, 20), padding=(2, 10))  # [B, 32, 49, 38]
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=(2, 2), padding=1)  # [B, 64, 25, 19]
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)  # [B, 128, 25, 19]
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 2), padding=(1, 1))  # [B, 128, 25, 10]
+        self.bn4 = nn.BatchNorm2d(128)
+        self.conv5 = nn.Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 2), padding=(1, 1))  # [B, 128, 25, 5]
+        self.bn5 = nn.BatchNorm2d(128)
+        self.conv6 = nn.Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 5), padding=(1, 0))  # [B, 128, 25, 1]
+        self.bn6 = nn.BatchNorm2d(128)
+        self.conv7 = nn.Conv2d(128, 128, kernel_size=(1, 1), stride=1, padding=0)  # [B, 128, 25, 1]
+        self.bn7 = nn.BatchNorm2d(128)
+        
+    def forward(self, x):
+        # Input shape: [batch_size, 1, 197, 768]
+        x = F.relu(self.bn1(self.conv1(x)))  # [B, 32, 49, 38]
+        x = F.relu(self.bn2(self.conv2(x)))  # [B, 64, 25, 19]
+        x = F.relu(self.bn3(self.conv3(x)))  # [B, 128, 25, 19]
+        x = F.relu(self.bn4(self.conv4(x)))  # [B, 128, 25, 10]
+        x = F.relu(self.bn5(self.conv5(x)))  # [B, 128, 25, 5]
+        x = F.relu(self.bn6(self.conv6(x)))  # [B, 128, 25, 1]
+        x = F.relu(self.bn7(self.conv7(x)))  # [B, 128, 25, 1]
+        
+        # Pad to [B, 128, 26, 26]
+        x = F.pad(x, (0, 25, 0, 1))  # Pad width from 1 to 26, height from 25 to 26
+        
+        # Flatten to [batch_size, 128*26*26]
+        x = x.view(x.size(0), -1)  # [B, 128*26*26]
+        
+        return x
+
 
 class VisionTransformerBase(nn.Module):
-    def __init__(self, pretrained=True):
+    def __init__(self, image_size=224, patch_size=16, pretrained=False):
         super(VisionTransformerBase, self).__init__()
-        # Load the pre-trained ViT-B/16 model
+        # Load the ViT-B/16 model without pretrained weights
         vit = models.vit_b_16(pretrained=pretrained)
         
         # Extract the transformer backbone without final linear layer
@@ -155,12 +120,16 @@ class VisionTransformerBase(nn.Module):
         
         # Store configuration
         self.hidden_dim = vit.hidden_dim
-        self.image_size = vit.image_size
-        self.patch_size = vit.patch_size
-        self.num_patches = (vit.image_size // vit.patch_size) ** 2
+        self.image_size = image_size  # Dynamic image size (H=W)
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
 
     def forward(self, x):
-        # Input shape: [B, C, H, W]
+        # Input shape: [batch_size, C, H, W]
+        # Validate input size
+        if x.size(2) != self.image_size or x.size(3) != self.image_size:
+            raise ValueError(f"Expected input size [batch_size, 3, {self.image_size}, {self.image_size}], got {x.shape}")
+        
         x = self.conv_norm(x)  # [B, hidden_dim, H', W']
         x = self.patch_embed(x)  # [B, num_patches, hidden_dim]
         
@@ -172,5 +141,121 @@ class VisionTransformerBase(nn.Module):
         # Process through transformer encoder
         x = self.encoder(x)  # [B, num_patches + 1, hidden_dim]
         
-        # Return patch embeddings (including class token)
+        # Reshape to [batch_size, 1, num_patches + 1, hidden_dim]
+        x = x.unsqueeze(1)  # [B, 1, num_patches + 1, hidden_dim]
+        
         return x
+
+class CNNProcessor(nn.Module):
+    def __init__(self, num_patches, output_size=26):
+        super(CNNProcessor, self).__init__()
+        self.output_size = output_size
+        self.num_patches = num_patches
+        
+        # Calculate strides dynamically based on num_patches
+        height = int((num_patches + 1) ** 0.5)  # Approximate height for square patch grid
+        stride_h = max(1, (height + output_size - 1) // output_size)  # Dynamic stride for height
+        stride_w = max(1, (768 + output_size - 1) // output_size)  # Dynamic stride for width
+        
+        # CNN architecture with dynamic strides
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(5, 20), stride=(stride_h, stride_w), padding=(2, 10))
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=(1, 1), padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=(1, 1), padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 128, kernel_size=3, stride=(1, 1), padding=1)
+        self.bn4 = nn.BatchNorm2d(128)
+        
+    def forward(self, x):
+        # Input shape: [batch_size, 1, num_patches + 1, 768]
+        x = F.relu(self.bn1(self.conv1(x)))  # [B, 32, ~output_size, ~output_size]
+        x = F.relu(self.bn2(self.conv2(x)))  # [B, 64, ~output_size, ~output_size]
+        x = F.relu(self.bn3(self.conv3(x)))  # [B, 128, ~output_size, ~output_size]
+        x = F.relu(self.bn4(self.conv4(x)))  # [B, 128, ~output_size, ~output_size]
+        
+        # Pad or crop to exactly [batch_size, 128, output_size, output_size]
+        current_h, current_w = x.shape[2], x.shape[3]
+        if current_h != self.output_size or current_w != self.output_size:
+            # Calculate padding or cropping
+            pad_h = max(0, self.output_size - current_h)
+            pad_w = max(0, self.output_size - current_w)
+            crop_h = max(0, current_h - self.output_size)
+            crop_w = max(0, current_w - self.output_size)
+            
+            if pad_h > 0 or pad_w > 0:
+                x = F.pad(x, (0, pad_w, 0, pad_h))  # Pad with zeros
+            if crop_h > 0 or crop_w > 0:
+                x = x[:, :, :self.output_size, :self.output_size]  # Crop to output_size
+            
+        # Output shape: [batch_size, 128, output_size, output_size]
+        return x
+
+class REM(nn.Module):
+    def __init__(self, image_size=224, patch_size=16, from_scratch=True, rotations=8):
+        super(REM, self).__init__()
+        
+        # Replace resnet34 with VisionTransformerBase + CNNProcessor
+        self.vit = VisionTransformerBase(image_size=image_size, patch_size=patch_size, pretrained=not from_scratch)
+        self.cnn = CNNProcessor(num_patches=(image_size // patch_size) ** 2, output_size=26)
+        self.encoder = nn.Sequential(self.vit, self.cnn)
+
+        # Rotations
+        self.angles = -torch.arange(0, 359.00001, 360.0/rotations)/180*torch.pi
+
+    def forward(self, x):
+        equ_features = []
+        batch_size = x.size(0)
+
+        for i in range(len(self.angles)):
+            # Input warp grids
+            aff = torch.zeros(batch_size, 2, 3).cuda()
+            aff[:, 0, 0] = torch.cos(-self.angles[i])
+            aff[:, 0, 1] = torch.sin(-self.angles[i])
+            aff[:, 1, 0] = -torch.sin(-self.angles[i])
+            aff[:, 1, 1] = torch.cos(-self.angles[i])
+            grid = F.affine_grid(aff, list(x.size()), align_corners=True).type(x.type())
+            
+            # Input warp
+            warped_im = F.grid_sample(x, grid, align_corners=True, mode='bicubic')
+                                    
+            # CNN backbone feature (VisionTransformerBase + CNNProcessor)
+            out = self.encoder(warped_im)  # [B, 128, 26, 26]
+
+            # Output feature warp grids
+            if i == 0:
+                im1_init_size = out.size()
+
+            aff = torch.zeros(batch_size, 2, 3).cuda()
+            aff[:, 0, 0] = torch.cos(self.angles[i])
+            aff[:, 0, 1] = torch.sin(self.angles[i])
+            aff[:, 1, 0] = -torch.sin(self.angles[i])
+            aff[:, 1, 1] = torch.cos(self.angles[i])
+            grid = F.affine_grid(aff, list(im1_init_size), align_corners=True).type(x.type())
+
+            # Output feature warp
+            out = F.grid_sample(out, grid, align_corners=True, mode='bicubic')
+            equ_features.append(out.unsqueeze(-1))
+        
+        equ_features = torch.cat(equ_features, dim=-1)  # [B, C, H, W, R]
+        B, C, H, W, R = equ_features.shape
+        equ_features = torch.max(equ_features, dim=-1, keepdim=False)[0]  # [B, 128, 26, 26]
+
+        aff = torch.zeros(batch_size, 2, 3).cuda()
+        aff[:, 0, 0] = 1
+        aff[:, 0, 1] = 0
+        aff[:, 1, 0] = 0
+        aff[:, 1, 1] = 1
+
+        # Upsample for NetVLAD
+        B, C, H_orig, W_orig = x.size()
+        grid = F.affine_grid(aff, [B, 128, H_orig, W_orig], align_corners=True)
+        out1 = F.grid_sample(equ_features, grid, align_corners=True, mode='bicubic')
+        out1 = F.normalize(out1, dim=1)
+        
+        # Upsample for keypoints
+        grid = F.affine_grid(aff, [B, 128, H_orig, W_orig], align_corners=True)
+        out2 = F.grid_sample(equ_features, grid, align_corners=True, mode='bicubic')
+        out2 = F.normalize(out2, dim=1)
+        
+        return out1, out2
