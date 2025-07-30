@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import numpy as np
 import torchvision.models as models
 from torchvision.models.vision_transformer import ViT_B_16_Weights
+import math
+import einops
 
 class NetVLAD(nn.Module):
     """NetVLAD layer implementation"""
@@ -68,53 +70,150 @@ class REIN(nn.Module):
         global_desc = self.pooling(out1)  # Use NetVLAD for final global descriptor
         return out1, global_desc
 
-class VisionTransformerBase(nn.Module):
-    def __init__(self, image_size=224, patch_size=16, pretrained=False):
-        super(VisionTransformerBase, self).__init__()
-        # Load ViT-B/16 with weights=None for training from scratch
-        weights = None if not pretrained else ViT_B_16_Weights.IMAGENET1K_V1
-        self.vit = models.vit_b_16(weights=weights)
+class MambaBlock(nn.Module):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.dim = dim
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
         
-        # Extract and reconfigure components
-        self.conv_proj = self.vit.conv_proj  # Patch embedding convolution
-        self.encoder = self.vit.encoder
-        self.class_token = nn.Parameter(self.vit.class_token.data.clone())
+        self.d_inner = int(expand * dim)
         
-        # Initialize dynamic positional embedding
-        self.hidden_dim = self.vit.hidden_dim
-        self.patch_size = patch_size
-        self.num_channels = 3  # Assuming RGB input
-        self.pos_embedding = nn.Parameter(torch.zeros(1, (image_size // patch_size) ** 2 + 1, self.hidden_dim, device='cuda'))
-        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
-
+        # Projects to higher dimension for Mamba processing
+        self.in_proj = nn.Linear(dim, self.d_inner * 2)
+        
+        # Convolution for local context
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            padding='same',
+            groups=self.d_inner
+        )
+        
+        # SSM parameters
+        self.x_proj = nn.Linear(self.d_inner, self.d_state + self.d_conv + 1)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_state)
+        
+        # Initialize A, B, C for state space model with proper shapes
+        self.A = nn.Parameter(torch.randn(self.d_state) / self.d_state**0.5)  # [d_state]
+        self.B = nn.Parameter(torch.randn(self.d_inner, self.d_state) / self.d_state**0.5)  # [d_inner, d_state]
+        self.C = nn.Parameter(torch.randn(self.d_inner, self.d_state) / self.d_state**0.5)  # [d_inner, d_state]
+        
+        # Output projection
+        self.out_proj = nn.Linear(self.d_inner, dim)
+        
     def forward(self, x):
-        # Input shape: [batch_size, C, H, W]
-        batch_size, C, H, W = x.shape
-        if C != self.num_channels:
-            raise ValueError(f"Expected {self.num_channels} channels, got {C}")
-
-        # Always resize input to 224x224 for ViT
-        if H != 224 or W != 224:
-            x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-
-        # Forward through ViT components
-        # Patch embedding
-        x = self.vit.conv_proj(x)  # [B, hidden_dim, grid, grid]
+        batch, seq_len, _ = x.shape
         
-        # Flatten
-        x = x.flatten(2).transpose(1, 2)  # [B, n_patches, hidden_dim]
+        # Input projection and splitting
+        x_and_res = self.in_proj(x)  # [batch, seq_len, 2 * d_inner]
+        x_copy, res = x_and_res.chunk(2, dim=-1)
+        
+        # Convolution branch
+        conv_state = self.conv1d(x_copy.permute(0, 2, 1)).permute(0, 2, 1)
+        
+        # SSM branch
+        x_ssm = self.x_proj(conv_state)  # [batch, seq_len, d_state + d_conv + 1]
+        delta, beta, gamma = torch.split(x_ssm, [self.d_state, self.d_conv, 1], dim=-1)
+        delta = F.softplus(self.dt_proj(conv_state))
+        
+        # Discretize continuous-time SSM into discrete-time
+        # Proper broadcasting for A matrix
+        dA = torch.exp(-delta * F.softplus(self.A.view(1, 1, -1)))  # [batch, seq_len, d_state]
+        dB = F.softplus(self.B)  # [d_inner, d_state]
+        dC = self.C  # [d_inner, d_state]
+        
+        # Run discretized SSM with proper dimension handling
+        h = torch.zeros(batch, self.d_inner, self.d_state, device=x.device)
+        outs = []
+        
+        # Reshape A, B, C matrices for broadcasting
+        dA = dA.view(batch, seq_len, 1, self.d_state)  # [B, seq_len, 1, d_state]
+        dB = dB.view(1, 1, self.d_inner, self.d_state)  # [1, 1, d_inner, d_state]
+        dC = dC.view(1, 1, self.d_inner, self.d_state)  # [1, 1, d_inner, d_state]
+        
+        # Reshape input for broadcasting
+        x_copy = x_copy.view(batch, seq_len, self.d_inner, 1)  # [B, seq_len, d_inner, 1]
+        
+        for t in range(seq_len):
+            # Update hidden state with proper broadcasting
+            h = h.view(batch, 1, self.d_inner, self.d_state) * dA[:, t:t+1]  # [B, 1, d_inner, d_state]
+            h = h + x_copy[:, t:t+1] * dB  # [B, 1, d_inner, d_state]
+            h = h.view(batch, self.d_inner, self.d_state)  # [B, d_inner, d_state]
+            
+            # Compute output with proper broadcasting
+            y = (h.unsqueeze(1) * dC).sum(dim=-1)  # [B, 1, d_inner]
+            outs.append(y)
+        
+        out = torch.cat(outs, dim=1)  # [B, seq_len, d_inner]
+        out = out * F.silu(gamma) + res
+        
+        return self.out_proj(out)
+
+class VisionMamba(nn.Module):
+    def __init__(self, image_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=12, d_state=16):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        
+        # Patch embedding
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        # Position embedding
+        num_patches = (image_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # Mamba blocks
+        self.blocks = nn.ModuleList([
+            MambaBlock(embed_dim, d_state=d_state)
+            for _ in range(depth)
+        ])
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.zeros_(m.bias)
+            nn.init.ones_(m.weight)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x):
+        # Input shape: [batch_size, channels, height, width]
+        B, C, H, W = x.shape
+        
+        # Ensure input size matches expected size
+        if H != self.image_size or W != self.image_size:
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+        
+        # Patch embedding
+        x = self.patch_embed(x)  # [B, embed_dim, grid, grid]
+        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
         
         # Add class token
-        class_token = self.class_token.expand(x.shape[0], -1, -1)
-        x = torch.cat([class_token, x], dim=1)
+        cls_token = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_token, x], dim=1)
         
         # Add position embedding
-        x = x + self.pos_embedding
+        x = x + self.pos_embed
         
-        # Transformer encoder
-        x = self.vit.encoder(x)  # [B, n_patches + 1, hidden_dim]
-        
-        return x
+        # Apply Mamba blocks
+        for block in self.blocks:
+            x = block(x)
+            
+        return x  # [B, num_patches + 1, embed_dim]
 
 class CNNProcessor(nn.Module):
     def __init__(self, num_patches, input_channels=768, output_size=26):
@@ -164,9 +263,16 @@ class REM(nn.Module):
     def __init__(self, image_size=224, patch_size=16, from_scratch=True, rotations=8):
         super(REM, self).__init__()
         
-        # Replace resnet34 with VisionTransformerBase + CNNProcessor
-        self.vit = VisionTransformerBase(image_size=image_size, patch_size=patch_size, pretrained=not from_scratch)
-        self.cnn = CNNProcessor(num_patches=(image_size // patch_size) ** 2, input_channels=768, output_size=26)  # 768 is ViT's hidden_dim
+        # Use Vision Mamba + CNNProcessor
+        self.mamba = VisionMamba(
+            image_size=image_size,
+            patch_size=patch_size,
+            in_channels=3,
+            embed_dim=768,
+            depth=12,
+            d_state=16
+        )
+        self.cnn = CNNProcessor(num_patches=(image_size // patch_size) ** 2, input_channels=768, output_size=26)  # 768 is embedding dim
 
         # Rotations
         self.angles = -torch.arange(0, 359.00001, 360.0/rotations)/180*torch.pi
@@ -187,16 +293,16 @@ class REM(nn.Module):
             # Input warp
             warped_im = F.grid_sample(x, grid, align_corners=True, mode='bicubic')
 
-            # ViT backbone feature
-            vit_out = self.vit(warped_im)  # [B, num_patches+1, hidden_dim]
+            # Mamba backbone feature
+            mamba_out = self.mamba(warped_im)  # [B, num_patches+1, embed_dim]
             # Remove class token, reshape for CNN
-            vit_out = vit_out[:, 1:, :]  # [B, num_patches, hidden_dim]
-            B, num_patches, hidden_dim = vit_out.shape
+            mamba_out = mamba_out[:, 1:, :]  # [B, num_patches, embed_dim]
+            B, num_patches, hidden_dim = mamba_out.shape
             h = w = int(num_patches ** 0.5)
-            vit_out = vit_out.transpose(1, 2).reshape(B, hidden_dim, h, w)  # [B, hidden_dim, h, w]
+            mamba_out = mamba_out.transpose(1, 2).reshape(B, hidden_dim, h, w)  # [B, hidden_dim, h, w]
 
             # CNN backbone feature
-            out = self.cnn(vit_out)  # [B, 128, 26, 26]
+            out = self.cnn(mamba_out)  # [B, 128, 26, 26]
 
             # Output feature warp grids
             if i == 0:
